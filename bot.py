@@ -24,33 +24,14 @@ class Form(StatesGroup):
     waiting_cookies = State()
     waiting_cookie_file = State()
 
-# أزرار القائمة الرئيسية
 def main_menu():
     keyboard = InlineKeyboardMarkup(row_width=1)
     keyboard.add(
         InlineKeyboardButton("🚀 بدء فحص ملف جديد", callback_data="start_check"),
-        InlineKeyboardButton("ℹ️ معلومات البوت", callback_data="bot_info"),
-        InlineKeyboardButton("📊 إحصائيات", callback_data="stats")
+        InlineKeyboardButton("ℹ️ معلومات البوت", callback_data="bot_info")
     )
     return keyboard
 
-# أزرار النسخ بعد الفحص
-def result_actions(auth_token, auth_url_phone, auth_url_pc, auth_url_tv):
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        InlineKeyboardButton("📱 نسخ رابط الهاتف", callback_data=f"copy_phone:{auth_token}"),
-        InlineKeyboardButton("💻 نسخ رابط الكمبيوتر", callback_data=f"copy_pc:{auth_token}")
-    )
-    keyboard.add(
-        InlineKeyboardButton("📺 نسخ رابط التلفاز", callback_data=f"copy_tv:{auth_token}"),
-        InlineKeyboardButton("🔑 نسخ API Token", callback_data=f"copy_token:{auth_token}")
-    )
-    keyboard.add(
-        InlineKeyboardButton("🔄 فحص كوكيز آخر", callback_data="start_check")
-    )
-    return keyboard
-
-# أزرار اختيار نوع الإدخال
 def input_method():
     keyboard = InlineKeyboardMarkup(row_width=1)
     keyboard.add(
@@ -59,8 +40,51 @@ def input_method():
     )
     return keyboard
 
+def result_actions(nftoken, netflix_id):
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    keyboard.add(
+        InlineKeyboardButton("📱 نسخ رابط الهاتف", callback_data=f"copy_phone:{nftoken}"),
+        InlineKeyboardButton("💻 نسخ رابط الكمبيوتر", callback_data=f"copy_pc:{nftoken}"),
+        InlineKeyboardButton("📺 نسخ رابط التلفاز", callback_data=f"copy_tv:{nftoken}"),
+        InlineKeyboardButton("🔑 نسخ nftoken", callback_data=f"copy_token:{nftoken}"),
+        InlineKeyboardButton("🔄 فحص كوكيز آخر", callback_data="start_check")
+    )
+    return keyboard
+
+async def extract_nftoken(cookie_str: str) -> str:
+    """استخراج nftoken من الكوكيز"""
+    cookies_dict = {}
+    for cookie in cookie_str.split(';'):
+        cookie = cookie.strip()
+        if '=' in cookie:
+            name, value = cookie.split('=', 1)
+            cookies_dict[name.strip()] = value.strip()
+
+    # محاولة البحث عن nftoken مباشرة في الكوكيز
+    if 'nftoken' in cookies_dict:
+        return cookies_dict['nftoken']
+
+    # محاولة استخراجه من NetflixId و SecureNetflixId
+    netflix_id = cookies_dict.get('NetflixId', '')
+    secure_netflix_id = cookies_dict.get('SecureNetflixId', '')
+
+    if netflix_id and secure_netflix_id:
+        # تنسيق nftoken من المعرفات (هذه الطريقة تعتمد على طريقة عمل نتفليكس)
+        return f"{netflix_id}|{secure_netflix_id}"
+
+    # محاولة من Flwssn cookie
+    flwssn = cookies_dict.get('flwssn', '')
+    if flwssn:
+        return flwssn
+
+    # محاولة من clSharedContext
+    cl_shared = cookies_dict.get('clSharedContext', '')
+    if cl_shared:
+        return cl_shared
+
+    return ''
+
 async def check_netflix_cookie(cookie_str: str) -> dict:
-    """فحص الكوكيز واستخراج المعلومات والتوكن"""
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -74,14 +98,12 @@ async def check_netflix_cookie(cookie_str: str) -> dict:
         'email': None,
         'plan': None,
         'country': None,
-        'auth_token': None,
+        'nftoken': None,
         'netflix_id': None,
-        'secure_netflix_id': None,
         'error': None
     }
 
     async with aiohttp.ClientSession() as session:
-        # فحص معلومات الحساب
         try:
             async with session.get('https://www.netflix.com/YourAccount', headers=headers, timeout=15) as resp:
                 if resp.status == 200:
@@ -105,40 +127,35 @@ async def check_netflix_cookie(cookie_str: str) -> dict:
         except Exception as e:
             result['error'] = str(e)
 
-        # استخراج التوكن إذا كان الحساب صالح
         if result['valid']:
+            # استخراج nftoken
+            nftoken = await extract_nftoken(cookie_str)
+            result['nftoken'] = nftoken
+
+            # استخراج NetflixId
+            cookies_dict = {}
+            for cookie in cookie_str.split(';'):
+                cookie = cookie.strip()
+                if '=' in cookie:
+                    name, value = cookie.split('=', 1)
+                    cookies_dict[name.strip()] = value.strip()
+            result['netflix_id'] = cookies_dict.get('NetflixId', '')
+
+            # محاولة استخراج nftoken من صفحة الحساب
             try:
-                cookies_dict = {}
-                for cookie in cookie_str.split(';'):
-                    cookie = cookie.strip()
-                    if '=' in cookie:
-                        name, value = cookie.split('=', 1)
-                        cookies_dict[name.strip()] = value.strip()
-
-                netflix_id = cookies_dict.get('NetflixId', '')
-                secure_netflix_id = cookies_dict.get('SecureNetflixId', '')
-                result['netflix_id'] = netflix_id
-                result['secure_netflix_id'] = secure_netflix_id
-
-                # استخراج التوكن من الصفحة مباشرة
                 async with session.get('https://www.netflix.com/YourAccount', headers=headers, timeout=15) as resp2:
                     text2 = await resp2.text()
-                    token_match = re.search(r'authURL["\']?\s*:\s*["\']([^"\']+)["\']', text2)
-                    if token_match:
-                        full_url = token_match.group(1)
-                        token_extract = re.search(r'authToken=([^&]+)', full_url)
-                        if token_extract:
-                            result['auth_token'] = token_extract.group(1)
+                    # البحث عن nftoken في الصفحة
+                    nftoken_match = re.search(r'nftoken["\']?\s*:\s*["\']([^"\']+)["\']', text2)
+                    if nftoken_match:
+                        result['nftoken'] = nftoken_match.group(1)
                     else:
-                        # محاولة من netflixId
-                        token_match2 = re.search(r'["\']?authToken["\']?\s*:\s*["\']([^"\']+)["\']', text2)
-                        if token_match2:
-                            result['auth_token'] = token_match2.group(1)
-                        else:
-                            # استخدام netflixId كتوكين بديل
-                            result['auth_token'] = f"{netflix_id}|{secure_netflix_id}"
-            except Exception as e:
-                result['token_error'] = str(e)
+                        # البحث في أي رابط يحتوي على nftoken
+                        url_match = re.search(r'nftoken=([^&\'"\s]+)', text2)
+                        if url_match:
+                            result['nftoken'] = url_match.group(1)
+            except:
+                pass
 
     return result
 
@@ -151,8 +168,8 @@ async def cmd_start(message: types.Message):
 
 بعد الفحص ستحصل على:
 ✅ معلومات الحساب
-🔑 API Token
-📱 روابط تسجيل الدخول لجميع الأجهزة
+🔑 nftoken
+📱 روابط تسجيل دخول لجميع الأجهزة
     """
     await message.reply(welcome_text, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu())
 
@@ -163,7 +180,7 @@ async def process_bot_info(callback_query: types.CallbackQuery):
 
 هذا البوت يقوم بفحص كوكيز نتفليكس واستخراج:
 - معلومات الحساب
-- API Token
+- nftoken
 - روابط تسجيل دخول لجميع الأجهزة
 
 **طريقة الاستخدام:**
@@ -172,18 +189,6 @@ async def process_bot_info(callback_query: types.CallbackQuery):
 3. استلم النتائج مع أزرار النسخ
     """
     await callback_query.message.edit_text(info_text, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu())
-    await callback_query.answer()
-
-@dp.callback_query_handler(lambda c: c.data == 'stats')
-async def process_stats(callback_query: types.CallbackQuery):
-    stats_text = """
-📊 **إحصائيات البوت**
-
-✅ البوت يعمل
-🔄 عدد الفحوصات: غير محدود
-⚡ السرعة: فحص فوري
-    """
-    await callback_query.message.edit_text(stats_text, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu())
     await callback_query.answer()
 
 @dp.callback_query_handler(lambda c: c.data == 'start_check')
@@ -213,25 +218,17 @@ async def process_send_text(callback_query: types.CallbackQuery):
     await Form.waiting_cookies.set()
     await callback_query.answer()
 
-# استقبال الكوكيز كنص
 @dp.message_handler(state=Form.waiting_cookies, content_types=types.ContentTypes.TEXT)
 async def process_text_cookies(message: types.Message, state: FSMContext):
     cookie_str = message.text.strip()
-
     processing_msg = await message.reply("⏳ **جاري فحص الكوكيز...**", parse_mode=ParseMode.MARKDOWN)
 
     result = await check_netflix_cookie(cookie_str)
-
     await processing_msg.delete()
 
     if result['valid']:
-        auth_token = result.get('auth_token', '')
+        nftoken = result.get('nftoken', '')
         netflix_id = result.get('netflix_id', '')
-
-        # إنشاء روابط مختلفة للأجهزة
-        auth_url_phone = f"https://www.netflix.com/Login?authToken={auth_token}&netflixId={netflix_id}&device=phone"
-        auth_url_pc = f"https://www.netflix.com/Login?authToken={auth_token}&netflixId={netflix_id}&device=pc"
-        auth_url_tv = f"https://www.netflix.com/Login?authToken={auth_token}&netflixId={netflix_id}&device=tv"
 
         result_text = f"""
 ✅ **فحص ناجح!**
@@ -239,18 +236,17 @@ async def process_text_cookies(message: types.Message, state: FSMContext):
 📧 **الإيميل:** `{result['email'] or 'غير متوفر'}`
 💳 **الخطة:** `{result['plan'] or 'غير متوفر'}`
 🌍 **الدولة:** `{result['country'] or 'غير متوفر'}`
-🆔 **Netflix ID:** `{result['netflix_id'] or 'غير متوفر'}`
 
-🔑 **API Token:**
-`{auth_token or 'غير متوفر'}`
+🔑 **nftoken:**
+`{nftoken or 'غير متوفر'}`
 
-👇 **اضغط على الأزرار بالأسفل للنسخ:**
+👇 **اضغط على الأزرار بالأسفل لعرض روابط النسخ:**
         """
 
         await message.reply(
             result_text,
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=result_actions(auth_token, auth_url_phone, auth_url_pc, auth_url_tv)
+            reply_markup=result_actions(nftoken, netflix_id)
         )
     else:
         error_text = f"""
@@ -262,7 +258,6 @@ async def process_text_cookies(message: types.Message, state: FSMContext):
 
     await state.finish()
 
-# استقبال ملف الكوكيز
 @dp.message_handler(state=Form.waiting_cookie_file, content_types=types.ContentTypes.DOCUMENT)
 async def process_cookie_file(message: types.Message, state: FSMContext):
     processing_msg = await message.reply("⏳ **جاري فحص الملف...**", parse_mode=ParseMode.MARKDOWN)
@@ -273,7 +268,6 @@ async def process_cookie_file(message: types.Message, state: FSMContext):
     content = downloaded_file.read().decode('utf-8', errors='ignore')
 
     cookies_list = [line.strip() for line in content.split('\n') if line.strip()]
-
     await processing_msg.delete()
 
     if not cookies_list:
@@ -286,29 +280,23 @@ async def process_cookie_file(message: types.Message, state: FSMContext):
 
     for i, cookie in enumerate(cookies_list, 1):
         result = await check_netflix_cookie(cookie)
-
         if result['valid']:
             valid_count += 1
-            auth_token = result.get('auth_token', '')
-            netflix_id = result.get('netflix_id', '')
-            auth_url_phone = f"https://www.netflix.com/Login?authToken={auth_token}&netflixId={netflix_id}&device=phone"
-
+            nftoken = result.get('nftoken', '')
             results_text += f"""
 ✅ **كوكيز {i}:**
 📧 الإيميل: `{result['email'] or 'N/A'}`
 💳 الخطة: `{result['plan'] or 'N/A'}`
-🔑 Token: `{auth_token[:50]}...`
-🔗 الرابط: `{auth_url_phone}`
+🔑 nftoken: `{nftoken[:50]}...`
+🔗 https://netflix.com/?nftoken={nftoken}
 ---
 """
         else:
             results_text += f"❌ **كوكيز {i}:** غير صالح\n---\n"
-
         await asyncio.sleep(1)
 
     results_text += f"\n📈 **الإجمالي:** {valid_count}/{len(cookies_list)} صالح"
 
-    # تقسيم الرسالة إذا كانت طويلة
     if len(results_text) > 4000:
         parts = [results_text[i:i+4000] for i in range(0, len(results_text), 4000)]
         for part in parts:
@@ -318,7 +306,6 @@ async def process_cookie_file(message: types.Message, state: FSMContext):
 
     await state.finish()
 
-# أزرار النسخ
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith('copy_'))
 async def process_copy_buttons(callback_query: types.CallbackQuery):
     data = callback_query.data
@@ -329,29 +316,34 @@ async def process_copy_buttons(callback_query: types.CallbackQuery):
         return
 
     action = parts[0]
-    token = parts[1] if len(parts) > 1 else ''
+    nftoken = parts[1] if len(parts) > 1 else ''
+
+    # إنشاء الروابط بنفس صيغة المثال
+    base_url = "https://netflix.com/?nftoken="
+    link = base_url + nftoken
 
     if action == 'copy_token':
-        copy_text = token
-        label = "🔑 API Token"
+        copy_text = nftoken
+        label = "🔑 **nftoken**"
     elif action == 'copy_phone':
-        copy_text = f"https://www.netflix.com/Login?authToken={token}"
-        label = "📱 رابط الهاتف"
+        copy_text = link
+        label = "📱 **رابط الهاتف**"
     elif action == 'copy_pc':
-        copy_text = f"https://www.netflix.com/Login?authToken={token}"
-        label = "💻 رابط الكمبيوتر"
+        copy_text = link
+        label = "💻 **رابط الكمبيوتر**"
     elif action == 'copy_tv':
-        copy_text = f"https://www.netflix.com/Login?authToken={token}"
-        label = "📺 رابط التلفاز"
+        copy_text = link
+        label = "📺 **رابط التلفاز**"
     else:
-        copy_text = token
-        label = "نسخ"
+        copy_text = nftoken
+        label = "🔑 **nftoken**"
 
+    # إرسال الرابط في رسالة منفصلة مع كود بلوك للنسخ السهل
     await callback_query.message.reply(
-        f"{label}:\n\n`{copy_text}`\n\n✅ **تم النسخ تلقائياً - اضغط مطولاً على النص للنسخ اليدوي**",
+        f"{label}:\n\n`{copy_text}`\n\n⚠️ **اضغط مطولاً على النص للنسخ**",
         parse_mode=ParseMode.MARKDOWN
     )
-    await callback_query.answer("تم النسخ ✅", show_alert=True)
+    await callback_query.answer("تم العرض ✅", show_alert=True)
 
 @dp.message_handler(commands=['cancel'], state='*')
 async def cmd_cancel(message: types.Message, state: FSMContext):
